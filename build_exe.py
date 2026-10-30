@@ -39,7 +39,7 @@ def main():
     StringStruct('ProductVersion', '0.13.1')])]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])])
 """, encoding='utf8')
-    inputs = ['app.py', 'core.py', 'ui_theme.py', 'session_effects.py', 'teleport_unlock.py', 'runtime_paths.py', 'profile.json',
+    inputs = ['app.py', 'core.py', 'errors.py', 'ui_theme.py', 'session_effects.py', 'teleport_unlock.py', 'runtime_paths.py', 'profile.json',
               'assets/app.ico', 'assets/THIRD_PARTY_NOTICES.txt']
     for relative in inputs:
         if not (SOURCE / relative).is_file():

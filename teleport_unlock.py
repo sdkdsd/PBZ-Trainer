@@ -12,6 +12,7 @@ import math
 import struct
 
 from core import api, open_process, close_handle, image_path, wpm, DataWriteError
+from errors import WRITE, report_issue
 
 MAGIC = b'PBZTRV13'
 ALLOCATION_SIZE = 8192
@@ -380,8 +381,9 @@ class TeleportUnlock:
                 self.candidate, self.samples = None, 0
                 try:
                     self.disarm()
-                except Exception:
-                    pass  # The adapter's independent three-second deadline still expires.
+                except Exception as disarm_error:
+                    # The adapter's independent three-second deadline still expires; surface it anyway (step 4).
+                    report_issue(self.game, WRITE, 'teleport', '传送心跳失败后解除失败：' + str(disarm_error))
                 self.status = '随地传送解锁：暂缓，' + str(error)
                 return False
 

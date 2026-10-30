@@ -13,6 +13,8 @@ import threading
 import time
 
 from runtime_paths import RESOURCE_HOME, log_directory
+from errors import (LOG, ROLLBACK, IssueQueue, ReadError, RollbackError, VersionError, WriteError,
+                    report_issue)
 
 HOME = RESOURCE_HOME
 K = C.WinDLL('kernel32', use_last_error=True)
@@ -43,7 +45,7 @@ process_first = api('Process32FirstW', [W.HANDLE, C.POINTER(ProcessEntry)], W.BO
 process_next = api('Process32NextW', [W.HANDLE, C.POINTER(ProcessEntry)], W.BOOL)
 
 
-class DataWriteError(RuntimeError):
+class DataWriteError(WriteError):
     def __init__(self, message, bytes_written):
         super().__init__(message)
         self.bytes_written = bytes_written
@@ -88,6 +90,7 @@ class Game:
     def __init__(self):
         self.lock = threading.RLock()
         self.handle = None
+        self.issues = IssueQueue()
         self.undo = {}
         self.auto_shachi = None
         self.auto_spirit_shadow = None
@@ -103,7 +106,7 @@ class Game:
         with self.path.open('rb') as f:
             digest = hashlib.file_digest(f, 'sha256').hexdigest()
         if digest != self.profile['sha256']:
-            raise RuntimeError('游戏版本不匹配，已停止写入；此版本只支持已核对版本')
+            raise VersionError('游戏版本不匹配，已停止写入；此版本只支持已核对版本')
         self.handle = open_process(0x410, False, self.pid)
         if not self.handle:
             raise RuntimeError('无法读取游戏进程')
@@ -114,14 +117,14 @@ class Game:
             header = self.read(self.base, 4096)
             nt = struct.unpack_from('<I', header, 60)[0]
             if header[:2] != b'MZ' or header[nt:nt + 4] != b'PE\0\0':
-                raise RuntimeError('游戏映像校验失败')
+                raise VersionError('游戏映像校验失败')
             if struct.unpack_from('<H', header, nt + 4)[0] != 0x8664:
-                raise RuntimeError('需要已核对的 64 位游戏')
+                raise VersionError('需要已核对的 64 位游戏')
             if struct.unpack_from('<I', header, nt + 80)[0] != self.profile['image_size']:
-                raise RuntimeError('游戏映像大小变化')
+                raise VersionError('游戏映像大小变化')
             self.refresh_pool()
             if self.name(0) != 'None' or self.name(3) != 'ByteProperty':
-                raise RuntimeError('引擎名称池校验失败')
+                raise VersionError('引擎名称池校验失败')
             self.context()
         except BaseException:
             self.close()
@@ -137,7 +140,7 @@ class Game:
         buffer = C.create_string_buffer(size)
         done = C.c_size_t()
         if not rpm(self.handle, address, buffer, size, C.byref(done)) or done.value != size:
-            raise RuntimeError('游戏内存读取失败，可能正在切场景或已退出')
+            raise ReadError('游戏内存读取失败，可能正在切场景或已退出')
         return buffer.raw[:size]
 
     def qword(self, address):
@@ -485,12 +488,17 @@ class Game:
                     elif self.token(owner) == token and (feature == 'health_floor' or feature.startswith('movement:')):
                         self.restore_record(record)
                         cleanup = 'attribute_components_restored_after_error'
-                except Exception:
-                    pass
+                except Exception as rollback_error:
+                    # Step 4: the rollback itself failed; memory may be half-written. Report, don't swallow.
+                    cleanup = 'rollback_failed'
+                    exc.rollback_errors = getattr(exc, 'rollback_errors', []) + [str(rollback_error)]
+                    exc.issue_reported = True
+                    report_issue(self, ROLLBACK, feature, '写入失败后回滚也失败：' + str(rollback_error))
                 try:
-                    self.log({'action': 'write_failed', 'feature': feature, 'cleanup': cleanup, 'error': str(exc)})
-                except OSError:
-                    pass
+                    self.log({'action': 'write_failed', 'feature': feature, 'cleanup': cleanup, 'error': str(exc),
+                              'rollback_errors': getattr(exc, 'rollback_errors', [])})
+                except OSError as log_error:
+                    report_issue(self, LOG, feature, log_error)
                 raise
             return record
 
@@ -599,6 +607,7 @@ class Game:
                     try:
                         self.restore_record(record)
                     except Exception as cleanup:
+                        report_issue(self, ROLLBACK, record['feature'], '精纯杀气补充回滚失败：' + str(cleanup))
                         self.log({'action': 'ultimate_cleanup_failed', 'error': str(cleanup), 'record': record})
                 raise
             return records
@@ -619,8 +628,8 @@ class Game:
             if active:
                 try:
                     self.log({'action': 'auto_medicine_stopped', 'kind': kind})
-                except OSError:
-                    pass
+                except OSError as log_error:
+                    report_issue(self, LOG, '', log_error)
 
     def pulse_auto_medicine(self, kind):
         with self.lock:
@@ -658,8 +667,8 @@ class Game:
             if active:
                 try:
                     self.log({'action': 'auto_ultimate_stopped'})
-                except OSError:
-                    pass
+                except OSError as log_error:
+                    report_issue(self, LOG, '', log_error)
 
     def pulse_auto_ultimate(self):
         with self.lock:
@@ -753,12 +762,12 @@ class Game:
             except Exception as exc:
                 try:
                     self.log({'action': 'floor_lock_stopped', 'reason': str(exc), 'record': record})
-                except OSError:
-                    pass
+                except OSError as log_error:
+                    report_issue(self, LOG, '', log_error)
                 try:
                     self.stop_floor_lock()
                 except Exception as cleanup:
-                    raise RuntimeError(str(exc) + '；原下限未能自动恢复：' + str(cleanup)) from exc
+                    raise RollbackError(str(exc) + '；原下限未能自动恢复：' + str(cleanup), [str(cleanup)]) from exc
                 raise
 
     def start_auto_health(self):
@@ -783,8 +792,8 @@ class Game:
             if was_active:
                 try:
                     self.log({'action': 'auto_health_stopped'})
-                except OSError:
-                    pass
+                except OSError as log_error:
+                    report_issue(self, LOG, '', log_error)
 
     def pulse_auto_health(self):
         with self.lock:
@@ -821,8 +830,8 @@ class Game:
             if was_active:
                 try:
                     self.log({'action': 'auto_shachi_stopped'})
-                except OSError:
-                    pass
+                except OSError as log_error:
+                    report_issue(self, LOG, '', log_error)
 
     def pulse_auto_shachi(self):
         with self.lock:
@@ -859,8 +868,8 @@ class Game:
             if active:
                 try:
                     self.log({'action': 'auto_spirit_shadow_stopped'})
-                except OSError:
-                    pass
+                except OSError as log_error:
+                    report_issue(self, LOG, '', log_error)
 
     def pulse_auto_spirit_shadow(self):
         with self.lock:
@@ -964,13 +973,8 @@ class Game:
                     record['multiplier'] = amount
                     self.undo[feature] = record
                     completed.append(record)
-            except Exception:
-                for record in reversed(completed):
-                    try:
-                        self.restore_record(record)
-                        del self.undo[record['feature']]
-                    except Exception:
-                        pass
+            except Exception as exc:
+                self._rollback_batch(completed, exc)
                 raise
             return completed
 
@@ -1015,13 +1019,8 @@ class Game:
                     record['multiplier'] = amount
                     self.undo[feature] = record
                     completed.append(record)
-            except Exception:
-                for record in reversed(completed):
-                    try:
-                        self.restore_record(record)
-                        del self.undo[record['feature']]
-                    except Exception:
-                        pass
+            except Exception as exc:
+                self._rollback_batch(completed, exc)
                 raise
             return completed
 
@@ -1065,16 +1064,26 @@ class Game:
                     record = self.patch(feature, values, expected_token=token)
                     self.undo[feature] = record
                     completed.append(record)
-            except Exception:
-                for record in reversed(completed):
-                    try:
-                        self.restore_record(record)
-                        del self.undo[record['feature']]
-                    except Exception:
-                        pass  # Keep the original undo record available for manual recovery.
+            except Exception as exc:
+                self._rollback_batch(completed, exc)
                 raise
             # Existing bounded trial callers use this primary record; all changes remain in undo.
             return next((r for r in completed if r['feature'] == 'cooldown'), None)
+
+    def _rollback_batch(self, completed, exc):
+        """Undo a partially applied group in reverse; failed entries stay in self.undo for manual recovery."""
+        failures = []
+        for record in reversed(completed):
+            try:
+                self.restore_record(record)
+                del self.undo[record['feature']]
+            except Exception as rollback_error:
+                failures.append(record['feature'] + '：' + str(rollback_error))
+                report_issue(self, ROLLBACK, record['feature'], '批量修改回滚失败，修改仍残留：' + str(rollback_error))
+        if failures:
+            exc.rollback_errors = getattr(exc, 'rollback_errors', []) + failures
+            exc.issue_reported = True
+        return failures
 
     def restore_modifiers(self):
         results = {}

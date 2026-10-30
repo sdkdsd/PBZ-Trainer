@@ -11,9 +11,12 @@ Windows x64 外部修改器，当前适配版本与指纹在 profile.json。
 - test_session_persistence.py：场景切换与恢复请求回归。
 - runtime_paths.py：内嵌资源路径与持久日志路径。
 - test_core.py：假内存测试，不连接实际游戏。
-- build_exe.py / build_exe.ps1：隔离环境构建单文件 EXE。
+- errors.py：错误分级、IssueQueue、状态栏汇总（第 4 步）。
+- test_errors.py：错误分类与 session 严重错误回归。
+- build_exe.py / build_exe.ps1：隔离环境构建单文件 EXE；inputs 须含全部会被报告哈希的源文件（含 errors.py）。
+- .github/workflows/ci.yml：Windows + Python 3.13 CI（unittest、self-check；可选打包）。
 
-命令：python -m unittest discover -s . -p 'test_*.py'；python app.py --self-check；python app.py --preview；./build_exe.ps1。
+命令：python -m unittest discover -s . -p 'test_*.py'（以 discover 实际用例数为准）；python app.py --self-check；python app.py --preview；./build_exe.ps1。CI 见 README「持续集成」；CI 绿不等于实机验收。
 
 保留默认关闭、版本及对象身份校验、写前日志和条件恢复；不得写入旧对象地址或覆盖游戏后续改变的值。研究结果不能冒充实机验收。材料编辑、攻击倍速与异常防护不在当前范围；不要关闭用户正在运行的其他修改器。
 

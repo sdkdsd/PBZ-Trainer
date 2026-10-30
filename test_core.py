@@ -9,6 +9,7 @@ import json
 import runtime_paths
 
 from core import Game, DataWriteError
+from errors import LOG, ROLLBACK
 
 
 class Fake(Game):
@@ -802,6 +803,96 @@ class Safeguards(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             g.refill_ultimate()
         self.assertEqual(restored, records)
+
+
+class RollbackFailureReporting(unittest.TestCase):
+    """Step 4: a failed rollback must be reported, keep undo, and never be swallowed."""
+
+    @staticmethod
+    def break_after_first(g):
+        normal, state = g.raw_write, {'n': 0}
+        def write(address, payload):
+            state['n'] += 1
+            if state['n'] > 1:
+                raise DataWriteError('injected write failure', 0)
+            normal(address, payload)
+        g.raw_write = write
+
+    def assert_rollback_reported(self, g, error, kept_feature):
+        self.assertTrue(error.rollback_errors)
+        self.assertTrue(error.issue_reported)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn(kept_feature, g.undo)
+        issues = g.issues.drain()
+        self.assertIn(ROLLBACK, [i['category'] for i in issues])
+        self.assertTrue(any(i['feature'] == kept_feature for i in issues))
+
+    def test_patch_rollback_failure_is_reported_not_passed(self):
+        g = Fake()
+        state = {'n': 0}
+        def write(address, payload):
+            state['n'] += 1
+            if state['n'] == 1:
+                g.memory = payload
+                raise DataWriteError('readback lost', len(payload))
+            raise DataWriteError('rollback write failed', 0)
+        g.raw_write = write
+        with self.assertRaises(DataWriteError) as caught:
+            g.patch('attack', (110, 110))
+        self.assertEqual(str(caught.exception), 'readback lost')
+        self.assertEqual(caught.exception.rollback_errors, ['rollback write failed'])
+        self.assertEqual([i['category'] for i in g.issues.drain()], [ROLLBACK])
+        failed = [row for row in g.logs if row['action'] == 'write_failed'][-1]
+        self.assertEqual(failed['cleanup'], 'rollback_failed')
+
+    def test_incoming_group_rollback_failure_keeps_undo(self):
+        g, memory = Safeguards.incoming_game()
+        self.break_after_first(g)
+        with self.assertRaises(DataWriteError) as caught:
+            g.modifier('incoming', 0.5)
+        self.assert_rollback_reported(g, caught.exception, 'incoming:physical')
+
+    def test_movement_group_rollback_failure_keeps_undo(self):
+        g, memory = Safeguards.movement_game()
+        self.break_after_first(g)
+        with self.assertRaises(DataWriteError) as caught:
+            g.modifier('movement', 1.5)
+        self.assert_rollback_reported(g, caught.exception, 'movement:WalkSpeed')
+
+    def test_cooldown_group_rollback_failure_keeps_undo(self):
+        g = Fake()
+        memory = {1100: struct.pack('<dd', 1, 2), 2100: struct.pack('<d', 15)}
+        g.context = lambda: {'pawn': 3000}
+        g.weapon_cooldown_features = lambda context=None: ['weapon_cooldown:Main:0']
+        g.targets = lambda feature: [(1000, 1100, '<dd')] if feature == 'cooldown' else [(2000, 2100, '<d')]
+        g.read = lambda address, size: memory[address]
+        g.raw_write = lambda address, payload: memory.__setitem__(address, payload)
+        self.break_after_first(g)
+        with self.assertRaises(DataWriteError) as caught:
+            g.modifier('cooldown', 0.1)
+        self.assert_rollback_reported(g, caught.exception, 'cooldown')
+
+    def test_rollback_failure_then_restore_does_not_double_write(self):
+        g, memory = Safeguards.incoming_game()
+        normal = g.raw_write
+        self.break_after_first(g)
+        with self.assertRaises(DataWriteError):
+            g.modifier('incoming', 0.5)
+        g.raw_write = normal
+        original = struct.pack('<ff', 1, 1.2)
+        results = g.restore_modifiers()
+        self.assertEqual(results, {'incoming:physical': '已恢复'})
+        self.assertEqual(bytes(memory[1000 + 0x140:1000 + 0x148]), original)
+        self.assertEqual(g.undo, {})
+        self.assertEqual(g.restore_modifiers(), {})
+
+    def test_log_oserror_is_counted(self):
+        g = Fake()
+        g.log = lambda row: (_ for _ in ()).throw(OSError('disk full'))
+        g.stop_auto_health()
+        g.auto_health = {'token': g.identity}
+        g.stop_auto_health()
+        self.assertGreaterEqual(g.issues.counts.get(LOG, 0), 1)
 
 
 if __name__ == '__main__':

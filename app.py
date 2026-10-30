@@ -7,9 +7,12 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from core import Game
+from errors import READ, ROLLBACK, TARGET_GONE, IssueQueue, classify, recent_lines, summarize_issues
 from session_effects import SessionEffects
 from runtime_paths import RESOURCE_HOME, log_directory
 from ui_theme import configure, Tooltip, BG, CARD
+
+ISSUE_COLORS = {'': '#9aa0ab', 'gray': '#9aa0ab', 'yellow': '#e0b84f', 'red': '#e0565b'}
 
 
 class DustDialog:
@@ -68,7 +71,7 @@ class DustDialog:
         except Exception as exc:
             self.state = self.state_game = None
             self.set_button.state(['disabled'])
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def apply(self):
         try:
@@ -81,7 +84,7 @@ class DustDialog:
             self.refresh()
             self.message.set('意识尘埃已设置；游戏数字可能需正常获得／消耗一次后刷新。可撤销上次设置。')
         except Exception as exc:
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def undo(self):
         try:
@@ -94,7 +97,7 @@ class DustDialog:
             self.refresh()
             self.message.set('上次设置已撤销；游戏显示可能仍需刷新。')
         except Exception as exc:
-            self.message.set(str(exc))
+            self.fail(exc)
 
 
 class Panel:
@@ -242,12 +245,66 @@ class Panel:
         self.controls.append(button)
         self.message = tk.StringVar(value='就绪。连接游戏后，按需启用功能。')
         ttk.Label(outer, textvariable=self.message, style='Hint.TLabel', wraplength=960).pack(anchor='w', pady=(9, 0))
+        # Step 4: graded error status bar. Red is sticky until "已知晓"; normal messages never overwrite it.
+        self.issues = IssueQueue()
+        self.issue_log = []
+        self.rollback_warned = False
+        status_bar = ttk.Frame(outer)
+        status_bar.pack(fill='x', pady=(6, 0))
+        self.issue_text = tk.StringVar(value='')
+        self.issue_label = tk.Label(status_bar, textvariable=self.issue_text, bg=BG, fg=ISSUE_COLORS[''],
+                                    font=('Microsoft YaHei UI', 9), anchor='w', justify='left', wraplength=620)
+        self.issue_label.pack(side='left', fill='x', expand=True)
+        ttk.Button(status_bar, text='已知晓', command=self.acknowledge_issues).pack(side='right')
+        ttk.Button(status_bar, text='详情', command=self.show_issues).pack(side='right', padx=(0, 6))
+        self.residual_button = ttk.Button(status_bar, text='恢复残留修改', command=self.restore)
+        self.residual_button.pack(side='right', padx=(0, 6))
+        self.controls.append(self.residual_button)
         self.enabled(False)
         if autoconnect:
             root.after(100, self.connect)
         root.after(1000, self.tick)
         root.after(200, self.resource_tick)
         root.after(50, self.health_tick)
+
+    def fail(self, exc):
+        """Show the error as before and grade it into the status bar (step 4)."""
+        self.message.set(str(exc))
+        category = classify(exc)
+        if category == TARGET_GONE or getattr(exc, 'issue_reported', False):
+            return
+        if category == READ:
+            self.issues.read_failed('', exc)
+            return
+        self.issues.report(category, '', exc)
+
+    def drain_issues(self):
+        new = self.issues.drain()
+        if self.game is not None and getattr(self.game, 'issues', None) is not None:
+            new += self.game.issues.drain()
+        if not new:
+            return
+        self.issue_log = (self.issue_log + new)[-100:]
+        color, text = summarize_issues(self.issue_log)
+        lines = recent_lines(self.issue_log, 1)
+        self.issue_text.set('⚠ ' + text + ('　最近：' + lines[-1] if lines else '') if text else '')
+        self.issue_label.configure(fg=ISSUE_COLORS[color])
+        if not self.rollback_warned and any(i['category'] == ROLLBACK for i in new):
+            self.rollback_warned = True
+            messagebox.showwarning('回滚失败，可能有残留修改',
+                                   '\n'.join(recent_lines([i for i in new if i['category'] == ROLLBACK]))
+                                   + '\n\n撤销记录已保留。请点底部“恢复残留修改”重试恢复；详情见 '
+                                   + str(log_directory() / 'actions.jsonl'))
+
+    def show_issues(self):
+        lines = recent_lines(self.issue_log)
+        messagebox.showinfo('最近 5 条错误', '\n'.join(lines) if lines else '当前没有错误记录。')
+
+    def acknowledge_issues(self):
+        self.issue_log = []
+        self.rollback_warned = False
+        self.issue_text.set('')
+        self.issue_label.configure(fg=ISSUE_COLORS[''])
 
     def show_licenses(self):
         window = tk.Toplevel(self.root)
@@ -341,7 +398,7 @@ class Panel:
         except Exception as exc:
             self.connection.set('●  连接不可用')
             self.enabled(False)
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def refresh(self):
         if not self.game:
@@ -391,7 +448,7 @@ class Panel:
             self.refresh()
             self.message.set({'health': '已单次回满生命，未锁血。', 'shachi': '已单次回满普通杀气。', 'medicine': '实际次数已补充。若游戏图标仍显示旧数字，切换一次快捷药品再切回即可刷新，无需重复点击。'}[feature])
         except Exception as exc:
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def modify(self, feature, text):
         try:
@@ -405,7 +462,7 @@ class Panel:
                               'incoming': '已调整玩家物理／元素承伤系数，未改玩家攻击；不含特殊真实伤害。请关闭生命保护后对比同一招式，或保留设置稍后观察。'
                               }.get(feature, '已应用并读回确认。请观察实战效果；可随时恢复原值。'))
         except Exception as exc:
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def toggle_floor(self):
         try:
@@ -414,6 +471,7 @@ class Panel:
                 self.game.stop_auto_health()
                 self.auto_health.set(False)
                 session = self.effect_session()
+                session.floor_disabled = False
                 session.floor_step()
                 self.health_status.set(session.floor_status)
                 self.message.set('已单次补满并维持生命下限；游戏重算时自动重设下限，不循环回填血量。')
@@ -426,7 +484,7 @@ class Panel:
             self.floor_lock.set(False)
             self.auto_health.set(False)
             self.health_status.set('生命保护已停止：' + str(exc))
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def toggle_one_hit(self):
         try:
@@ -444,7 +502,7 @@ class Panel:
             self.one_hit.set(bool(record and record.get('attack_mode') == 'one_hit'))
             if self.game:
                 self.effect_session().capture_attack()
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def toggle_health(self):
         try:
@@ -461,20 +519,22 @@ class Panel:
         except Exception as exc:
             self.auto_health.set(False)
             self.health_status.set('自动回血已停止：' + str(exc))
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def health_tick(self):
         if self.game and self.floor_lock.get():
             session = self.effect_session()
             session.floor_step()
             self.health_status.set(session.floor_status)
+            if session.floor_disabled:
+                self.floor_lock.set(False)
         try:
             if self.game and self.auto_health.get():
                 self.game.pulse_auto_health()
         except Exception as exc:
             self.auto_health.set(False)
             self.health_status.set('自动回血已停止：' + str(exc))
-            self.message.set(str(exc))
+            self.fail(exc)
         self.root.after(50, self.health_tick)
 
     def toggle_shachi(self):
@@ -488,7 +548,7 @@ class Panel:
                 self.message.set('锁杀气已关闭。')
         except Exception as exc:
             self.auto_shachi.set(False)
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def resource_tick(self):
         if self.game:
@@ -500,7 +560,7 @@ class Panel:
                 self.game.pulse_auto_shachi()
         except Exception as exc:
             self.auto_shachi.set(False)
-            self.message.set(str(exc))
+            self.fail(exc)
         for kind, variable in [('Hulu', self.auto_gourd), ('FeiJiu', self.auto_wine), ('ultimate', self.auto_ultimate),
                                ('spirit_shadow', self.auto_spirit_shadow)]:
             try:
@@ -530,7 +590,7 @@ class Panel:
         except Exception as exc:
             self.teleport_unlocked.set(False)
             self.teleport_status.set('传送：未启用／已停用，' + str(exc))
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def toggle_resource(self, kind, variable):
         try:
@@ -547,7 +607,7 @@ class Panel:
                              if variable.get() else '该资源锁定已停止；已补充的数量保留。')
         except Exception as exc:
             variable.set(False)
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def ultimate(self):
         try:
@@ -556,7 +616,7 @@ class Panel:
             self.refresh()
             self.message.set('已补满精纯杀气积累与点数，用于释放主武器绝技。游戏界面可能需要刷新。')
         except Exception as exc:
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def restore_movement(self):
         try:
@@ -565,7 +625,7 @@ class Panel:
             self.refresh()
             self.message.set('；'.join(key.split(':', 1)[1] + '：' + value for key, value in results.items()) or '当前没有本面板的移动加速记录。')
         except Exception as exc:
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def restore(self):
         try:
@@ -581,22 +641,24 @@ class Panel:
             self.refresh()
             self.message.set('；'.join(k + '：' + v for k, v in results.items()) or '当前没有需要恢复的攻击、怪物倍率、移速、冷却或生命下限修改。')
         except Exception as exc:
-            self.message.set(str(exc))
+            self.fail(exc)
 
     def tick(self):
         try:
             if self.game:
                 session = self.effect_session()
                 session.attack_step()
-                if session.attack_status and '暂缓' in session.attack_status:
+                if session.attack_status and ('暂缓' in session.attack_status or '已停用' in session.attack_status):
                     self.message.set(session.attack_status)
             self.refresh()
+            self.issues.read_ok()
         except Exception as exc:
             self.connection.set('●  玩家不可读')
             for metric in self.metrics.values():
                 metric.set('—')
             self.values.set('当前玩家不可读；刷新不会写入游戏。')
-            self.message.set(str(exc))
+            self.fail(exc)
+        self.drain_issues()
         self.root.after(1000, self.tick)
 
     def close(self):

@@ -2,6 +2,8 @@
 import math
 import struct
 
+from errors import ROLLBACK, WRITE, classify, report_issue
+
 
 class SessionEffects:
     def __init__(self, game):
@@ -11,6 +13,7 @@ class SessionEffects:
         self.stable = {}
         self.floor_status = ''
         self.attack_status = ''
+        self.floor_disabled = False  # set when a write/rollback failure stopped the floor lock
         self.capture_attack()
 
     def capture_attack(self):
@@ -55,7 +58,22 @@ class SessionEffects:
         while len(self.retired) > 64:
             self.retired.pop(next(iter(self.retired)))
 
+    def _serious(self, feature, error):
+        """Step 4: write/rollback failures must not be shown as a harmless "暂缓"."""
+        category = classify(error)
+        if category not in (ROLLBACK, WRITE):
+            return None
+        if not getattr(error, 'issue_reported', False):
+            report_issue(self.game, category, feature, error)
+            try:
+                error.issue_reported = True
+            except Exception:
+                pass
+        return category
+
     def floor_step(self):
+        if self.floor_disabled:
+            return False
         with self.game.lock:
             try:
                 owner, identity = self._attributes()
@@ -73,6 +91,12 @@ class SessionEffects:
                 return repaired
             except Exception as error:
                 self.stable.pop('health_floor', None)
+                category = self._serious('health_floor', error)
+                if category is not None:
+                    self.floor_disabled = True
+                    self.floor_status = ('强锁血：已停用，' + ('回滚失败，可能有残留修改' if category == ROLLBACK
+                                                         else '写入失败') + '（' + str(error) + '）')
+                    return False
                 self.floor_status = '强锁血：暂缓写入，等待角色就绪（' + str(error) + '）'
                 return False
 
@@ -115,5 +139,11 @@ class SessionEffects:
                 return observed != expected
             except Exception as error:
                 self.stable.pop('attack', None)
+                category = self._serious('attack', error)
+                if category is not None:
+                    self.attack_request = None
+                    self.attack_status = ('攻击倍率：已停用，' + ('回滚失败，可能有残留修改' if category == ROLLBACK
+                                                          else '写入失败') + '（' + str(error) + '）')
+                    return False
                 self.attack_status = '攻击倍率：暂缓写入，等待角色就绪（' + str(error) + '）'
                 return False

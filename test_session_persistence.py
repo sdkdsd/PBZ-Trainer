@@ -2,6 +2,7 @@
 import struct
 import unittest
 from app import Panel
+from errors import IssueQueue
 import test_core as fixtures
 
 class Variable:
@@ -35,6 +36,10 @@ class Persistence(unittest.TestCase):
         panel.values=Variable('');panel.connection=Variable('')
         panel.metrics={}
         panel.refresh=lambda:None
+        # Step 4 fields: fixture bypasses Panel.__init__, but tick()/fail() need them.
+        panel.issues=IssueQueue();panel.issue_log=[];panel.rollback_warned=False
+        panel.issue_text=Variable('')
+        panel.issue_label=type('Label',(),{'configure':lambda self,**kw:None})()
         return panel,g,memory,state
 
     def test_temporary_player_switch_does_not_turn_off_requested_floor(self):
